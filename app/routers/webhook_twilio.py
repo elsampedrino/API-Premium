@@ -143,12 +143,15 @@ async def _notify_agent_twilio(empresa, from_number: str, text: str) -> None:
         return
     body = f"📱 Nueva consulta por WhatsApp\nDe: +{from_number}\nMensaje: {text[:500]}"
     url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.TWILIO_ACCOUNT_SID}/Messages.json"
+    wa_from = settings.TWILIO_WHATSAPP_FROM
+    if not wa_from.startswith("whatsapp:"):
+        wa_from = f"whatsapp:{wa_from}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             url,
             auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
             data={
-                "From": settings.TWILIO_WHATSAPP_FROM,
+                "From": wa_from,
                 "To": f"whatsapp:+{agent_phone}",
                 "Body": body,
             },

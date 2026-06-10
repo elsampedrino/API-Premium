@@ -11,9 +11,11 @@ Diferencias con Meta Cloud API:
 """
 
 import logging
+import httpx
 from fastapi import APIRouter, Depends, Form, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.api_models import ChatMessageRequest
 from app.routers.webhook_whatsapp import (
@@ -73,6 +75,7 @@ async def receive_twilio(
         active, reason = is_bot_active(empresa)
         if not active:
             if reason == "business_hours" and _should_notify_hours(from_number):
+                await _notify_agent_twilio(empresa, from_number, text)
                 return _twiml(
                     f"¡Hola! 👋 Recibimos tu consulta. "
                     f"Un asesor de {empresa.nombre} se comunicará con vos a la brevedad."
@@ -129,3 +132,26 @@ async def receive_twilio(
         reply = "Hubo un error procesando tu consulta. Intentá de nuevo en un momento."
 
     return _twiml(reply)
+
+
+async def _notify_agent_twilio(empresa, from_number: str, text: str) -> None:
+    """Notifica al agente vía Twilio REST API cuando el bot está en business_hours."""
+    if not all([settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN, settings.TWILIO_WHATSAPP_FROM]):
+        return
+    agent_phone = (empresa.notificaciones or {}).get("whatsapp", {}).get("phone", "").strip()
+    if not agent_phone:
+        return
+    body = f"📱 Nueva consulta por WhatsApp\nDe: +{from_number}\nMensaje: {text[:500]}"
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.TWILIO_ACCOUNT_SID}/Messages.json"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            url,
+            auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+            data={
+                "From": settings.TWILIO_WHATSAPP_FROM,
+                "To": f"whatsapp:+{agent_phone}",
+                "Body": body,
+            },
+        )
+    if resp.status_code not in (200, 201):
+        logger.error("Twilio notify agent error %s: %s", resp.status_code, resp.text)

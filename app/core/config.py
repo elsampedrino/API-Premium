@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     WHATSAPP_VERIFY_TOKEN: str = ""   # Token secreto que define vos para el webhook
     WHATSAPP_HANDOFF_TEMPLATE_NAME: str = ""  # Template aprobado por Meta para notificar al agente
 
+    # ─── Twilio ───────────────────────────────────────────────────────────────
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_WHATSAPP_FROM: str = ""    # ej: whatsapp:+14155238886
+
     # ─── SMTP ─────────────────────────────────────────────────────────────────
     SMTP_HOST: str = ""
     SMTP_PORT: int = 465

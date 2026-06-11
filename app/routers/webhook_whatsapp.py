@@ -264,7 +264,7 @@ async def _send_template(
     to: str,
     template_name: str,
     params: list[str],
-    language: str = "es_AR",
+    language: str = "es",
 ) -> None:
     """Envía un template message aprobado por Meta al número indicado."""
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"

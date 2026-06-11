@@ -21,7 +21,9 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.api_models import ChatMessageRequest
 from app.models.db_models import Conversacion, Empresa
+from app.models.domain_models import ConversionEvent
 from app.repositories.empresas_repository import get_empresa_by_slug
+from app.services.analytics_service import AnalyticsService
 from app.services.chat_orchestrator import ChatOrchestrator
 from app.services.horario_service import is_bot_active
 from app.services.property_resolver import resolve_property
@@ -67,6 +69,37 @@ def _is_duplicate(message_id: str) -> bool:
         return True
     _SEEN_MESSAGE_IDS[message_id] = now
     return False
+
+
+# ── Analytics helper ─────────────────────────────────────────────────────────
+
+async def _log_whatsapp_analytics(
+    db: AsyncSession,
+    empresa_slug: str,
+    empresa: "Empresa",
+    from_number: str,
+    event: ConversionEvent,
+    extra_payload: dict | None = None,
+) -> None:
+    """Registra evento de analytics del canal WhatsApp. No bloquea el flujo principal."""
+    try:
+        tenant = await TenantResolver(db).resolve(empresa_slug)
+        payload = {
+            "channel": "whatsapp",
+            "from_number": from_number,
+            "bot_mode": empresa.bot_mode or "always_on",
+            **(extra_payload or {}),
+        }
+        await AnalyticsService(db).log_conversion_event(
+            id_empresa=tenant.id_empresa,
+            id_rubro=tenant.id_rubro,
+            canal="whatsapp",
+            evento=event,
+            session_id=from_number,
+            metadata=payload,
+        )
+    except Exception:
+        logger.exception("Error registrando analytics WhatsApp para %s", from_number)
 
 
 # ── Verificación ──────────────────────────────────────────────────────────────
@@ -147,15 +180,30 @@ async def _handle_message(
     if empresa:
         active, reason = is_bot_active(empresa)
         if not active:
-            if reason == "business_hours" and _should_notify_hours(from_number):
-                await _send_reply(
-                    phone_number_id, from_number,
-                    f"¡Hola! 👋 Recibimos tu consulta. "
-                    f"Un asesor de {empresa.nombre} se comunicará con vos a la brevedad.",
-                )
-                await _notify_agent_handoff(phone_number_id, empresa, from_number, text)
+            if reason == "business_hours":
+                if _should_notify_hours(from_number):
+                    await _send_reply(
+                        phone_number_id, from_number,
+                        f"¡Hola! 👋 Recibimos tu consulta. "
+                        f"Un asesor de {empresa.nombre} se comunicará con vos a la brevedad.",
+                    )
+                    agent_phone = (empresa.notificaciones or {}).get("whatsapp", {}).get("phone", "").strip()
+                    await _notify_agent_handoff(phone_number_id, empresa, from_number, text)
+                    await _log_whatsapp_analytics(
+                        db, empresa_slug, empresa, from_number,
+                        ConversionEvent.WHATSAPP_HANDOFF_BUSINESS_HOURS,
+                        {"handoff_type": "business_hours", "agent_phone": agent_phone},
+                    )
             logger.info("Bot inactivo (%s) para %s — sin respuesta IA", reason, from_number)
             return
+
+    # ── Bot activo en modo after_hours: registrar turno atendido por IA ────────
+    if empresa and empresa.bot_mode == "after_hours":
+        await _log_whatsapp_analytics(
+            db, empresa_slug, empresa, from_number,
+            ConversionEvent.WHATSAPP_BOT_AFTER_HOURS,
+            {},
+        )
 
     # Intentar identificar propiedad específica por Tokko ID en la URL
     prop = None

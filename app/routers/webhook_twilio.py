@@ -18,8 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.api_models import ChatMessageRequest
+from app.models.domain_models import ConversionEvent
 from app.routers.webhook_whatsapp import (
     DOMAIN_SLUG,
+    _log_whatsapp_analytics,
     _resolve_empresa,
     _should_notify_hours,
 )
@@ -74,13 +76,28 @@ async def receive_twilio(
     if empresa:
         active, reason = is_bot_active(empresa)
         if not active:
-            if reason == "business_hours" and _should_notify_hours(from_number):
-                await _notify_agent_twilio(empresa, from_number, text)
-                return _twiml(
-                    f"¡Hola! 👋 Recibimos tu consulta. "
-                    f"Un asesor de {empresa.nombre} se comunicará con vos a la brevedad."
-                )
+            if reason == "business_hours":
+                if _should_notify_hours(from_number):
+                    agent_phone = (empresa.notificaciones or {}).get("whatsapp", {}).get("phone", "").strip()
+                    await _notify_agent_twilio(empresa, from_number, text)
+                    await _log_whatsapp_analytics(
+                        db, empresa_slug, empresa, from_number,
+                        ConversionEvent.WHATSAPP_HANDOFF_BUSINESS_HOURS,
+                        {"handoff_type": "business_hours", "agent_phone": agent_phone},
+                    )
+                    return _twiml(
+                        f"¡Hola! 👋 Recibimos tu consulta. "
+                        f"Un asesor de {empresa.nombre} se comunicará con vos a la brevedad."
+                    )
             return Response(content="", status_code=200)
+
+    # ── Bot activo en modo after_hours: registrar turno atendido por IA ────────
+    if empresa and empresa.bot_mode == "after_hours":
+        await _log_whatsapp_analytics(
+            db, empresa_slug, empresa, from_number,
+            ConversionEvent.WHATSAPP_BOT_AFTER_HOURS,
+            {},
+        )
 
     # ── Resolver propiedad por URL ────────────────────────────────────────────
     prop = None

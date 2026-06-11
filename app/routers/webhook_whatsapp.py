@@ -312,4 +312,5 @@ async def _notify_agent_handoff(
         agent_phone,
         template_name,
         params=[from_number, text[:1000]],
+        language=settings.WHATSAPP_HANDOFF_TEMPLATE_LANGUAGE,
     )

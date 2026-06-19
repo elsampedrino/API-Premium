@@ -1,21 +1,25 @@
 """
 cliente_dashboard.py — Dashboard para el usuario cliente (inmobiliaria).
 
-Ruta: GET /cliente/dashboard
+Ruta: GET /cliente/dashboard?periodo=mes_actual|7d|30d|90d
 
 Devuelve en una sola llamada:
-  - KPIs del mes (leads, conversaciones, propiedades activas, tokens*)
-  - Leads recientes (últimos 15, enriquecidos con título de propiedad)
-  - Actividad del bot (conversaciones del mes + promedio diario)
-  - Propiedades con más leads del mes (top 10)
-  - Propiedades más consultadas sin lead del mes (top 10)
+  - KPIs del período (leads, conversaciones, propiedades activas)
+  - KPIs WhatsApp (consultas, IA, derivadas humano, % automatización, leads)
+  - Leads recientes (últimos 15, con canal)
+  - Actividad del bot (conversaciones del período + promedio diario)
+  - Propiedades con más leads (top 10)
+  - Propiedades más consultadas sin lead (top 10)
   - Alertas simples para el cliente
 
-* tokens_mes calculado en backend pero no expuesto en UI cliente por decisión de producto.
+TODO (futura sección "Atención fuera de horario"):
+  - consultas_fuera_horario (whatsapp_bot_after_hours)
+  - leads_generados_fuera_horario (leads where canal=whatsapp + conversion after_hours)
+  - tasa_conversion_after_hours
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +33,21 @@ router = APIRouter()
 # Rubro inmobiliaria — único punto de definición para este módulo
 _ID_RUBRO_INMOBILIARIA = 1
 
+_PERIODOS_VALIDOS = {"mes_actual", "7d", "30d", "90d"}
+
+
+def _calcular_desde(periodo: str) -> datetime:
+    """Devuelve el datetime UTC de inicio del período solicitado."""
+    now = datetime.now(timezone.utc)
+    if periodo == "7d":
+        return now - timedelta(days=7)
+    if periodo == "30d":
+        return now - timedelta(days=30)
+    if periodo == "90d":
+        return now - timedelta(days=90)
+    # mes_actual (default)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
 
 # ─── Modelos de respuesta ─────────────────────────────────────────────────────
 
@@ -37,7 +56,14 @@ class ClienteKPIs(BaseModel):
     leads_nuevos: int
     conversaciones_mes: int
     propiedades_activas: int
-    tokens_mes: int  # calculado en backend, no expuesto en UI cliente
+
+
+class WhatsAppKPIs(BaseModel):
+    consultas_whatsapp: int
+    ia_respondio: int
+    derivadas_humano: int
+    porcentaje_automatizacion: float   # 0–100
+    leads_whatsapp: int
 
 
 class LeadResumen(BaseModel):
@@ -46,6 +72,7 @@ class LeadResumen(BaseModel):
     telefono: str | None
     propiedad_titulo: str | None
     estado: str
+    canal: str
 
 
 class ActividadBot(BaseModel):
@@ -74,7 +101,9 @@ class AlertaCliente(BaseModel):
 
 class ClienteDashboardResponse(BaseModel):
     empresa_nombre: str
+    periodo: str
     kpis: ClienteKPIs
+    whatsapp_kpis: WhatsAppKPIs
     leads_recientes: list[LeadResumen]
     actividad_bot: ActividadBot
     props_con_leads: list[PropConLeads]
@@ -98,34 +127,62 @@ def _ubicacion(atributos: dict | None) -> str | None:
 
 @router.get("", response_model=ClienteDashboardResponse)
 async def get_cliente_dashboard(
+    periodo: str = Query("mes_actual", description="Período: mes_actual | 7d | 30d | 90d"),
     db: AsyncSession = Depends(get_db),
     current_user: UsuarioAdmin = Depends(get_current_admin),
 ):
-    emp = current_user.id_empresa
+    if periodo not in _PERIODOS_VALIDOS:
+        periodo = "mes_actual"
+    emp   = current_user.id_empresa
+    desde = _calcular_desde(periodo)
 
-    # ── KPIs (una sola query) ──────────────────────────────────────────────────
+    # ── KPIs principales ───────────────────────────────────────────────────────
     kpi_row = await db.execute(text("""
         SELECT
             (SELECT COUNT(*) FROM leads
-             WHERE id_empresa = :emp
-               AND created_at >= date_trunc('month', NOW()))              AS leads_mes,
+             WHERE id_empresa = :emp AND created_at >= :desde)            AS leads_mes,
             (SELECT COUNT(*) FROM leads
              WHERE id_empresa = :emp AND estado = 'nuevo'
-               AND created_at >= date_trunc('month', NOW()))              AS leads_nuevos,
+               AND created_at >= :desde)                                  AS leads_nuevos,
             (SELECT COUNT(*) FROM premium_chat_logs
-             WHERE id_empresa = :emp
-               AND created_at >= date_trunc('month', NOW()))              AS conversaciones_mes,
+             WHERE id_empresa = :emp AND created_at >= :desde)            AS conversaciones_mes,
             (SELECT COUNT(*) FROM items
-             WHERE id_empresa = :emp AND activo = true)                   AS propiedades_activas,
-            (SELECT COALESCE(SUM(tokens_total), 0) FROM premium_chat_logs
-             WHERE id_empresa = :emp
-               AND created_at >= date_trunc('month', NOW()))              AS tokens_mes
-    """), {"emp": emp})
+             WHERE id_empresa = :emp AND activo = true)                   AS propiedades_activas
+    """), {"emp": emp, "desde": desde})
     kpi = kpi_row.mappings().one()
 
-    # ── Leads recientes ────────────────────────────────────────────────────────
+    # ── WhatsApp KPIs ─────────────────────────────────────────────────────────
+    wa_row = await db.execute(text("""
+        SELECT
+            (SELECT COUNT(*) FROM premium_chat_logs
+             WHERE id_empresa = :emp AND canal = 'whatsapp'
+               AND created_at >= :desde)                                      AS consultas_whatsapp,
+            (SELECT COUNT(*) FROM premium_conversion_logs
+             WHERE id_empresa = :emp AND event_type = 'whatsapp_bot_after_hours'
+               AND created_at >= :desde)                                      AS ia_respondio,
+            (SELECT COUNT(*) FROM premium_conversion_logs
+             WHERE id_empresa = :emp AND event_type = 'whatsapp_handoff_business_hours'
+               AND created_at >= :desde)                                      AS derivadas_humano,
+            (SELECT COUNT(*) FROM leads
+             WHERE id_empresa = :emp AND canal = 'whatsapp'
+               AND created_at >= :desde)                                      AS leads_whatsapp
+    """), {"emp": emp, "desde": desde})
+    wa = wa_row.mappings().one()
+    _ia    = int(wa["ia_respondio"])
+    _human = int(wa["derivadas_humano"])
+    _total_wa = _ia + _human
+    _pct_autom = round(_ia / _total_wa * 100, 1) if _total_wa > 0 else 0.0
+    whatsapp_kpis = WhatsAppKPIs(
+        consultas_whatsapp        = int(wa["consultas_whatsapp"]),
+        ia_respondio              = _ia,
+        derivadas_humano          = _human,
+        porcentaje_automatizacion = _pct_autom,
+        leads_whatsapp            = int(wa["leads_whatsapp"]),
+    )
+
+    # ── Leads recientes (últimos 15 siempre, sin filtro de período) ──────────
     leads_rows = await db.execute(text("""
-        SELECT id_lead, nombre, telefono, estado, metadata, created_at
+        SELECT id_lead, nombre, telefono, estado, canal, metadata, created_at
         FROM leads
         WHERE id_empresa = :emp
         ORDER BY created_at DESC
@@ -177,19 +234,21 @@ async def get_cliente_dashboard(
                 or None
             ),
             estado           = r["estado"],
+            canal            = r["canal"] or "widget",
         )
         for r in leads_raw
     ]
 
     # ── Actividad del bot ──────────────────────────────────────────────────────
+    _dias_periodo = (datetime.now(timezone.utc) - desde).days or 1
     act_row = await db.execute(text("""
         SELECT
-            COUNT(*)::int                                                               AS conversaciones_mes,
-            ROUND(COUNT(*) / GREATEST(EXTRACT(DAY FROM NOW())::numeric, 1), 1)::float  AS promedio_diario
+            COUNT(*)::int                                                    AS conversaciones_mes,
+            ROUND(COUNT(*) / GREATEST(:dias::numeric, 1), 1)::float         AS promedio_diario
         FROM premium_chat_logs
         WHERE id_empresa = :emp
-          AND created_at >= date_trunc('month', NOW())
-    """), {"emp": emp})
+          AND created_at >= :desde
+    """), {"emp": emp, "desde": desde, "dias": _dias_periodo})
     act = act_row.mappings().one()
 
     # ── Propiedades con más leads ──────────────────────────────────────────────
@@ -208,12 +267,12 @@ async def get_cliente_dashboard(
                  END
              ) AS prop
         WHERE id_empresa = :emp
-          AND created_at >= date_trunc('month', NOW())
+          AND created_at >= :desde
           AND (prop->>'id') IS NOT NULL
         GROUP BY (prop->>'id'), prop->>'titulo'
         ORDER BY leads_mes DESC
         LIMIT 20
-    """), {"emp": emp})
+    """), {"emp": emp, "desde": desde})
     leads_props_raw = leads_props_rows.mappings().all()
 
     # Resolver UUIDs contra items para obtener external_id y atributos
@@ -265,11 +324,11 @@ async def get_cliente_dashboard(
         JOIN items i ON i.id_item = pcli.id_item AND i.id_empresa = :emp
         WHERE pcl.id_empresa  = :emp
           AND pcl.id_lead      IS NULL
-          AND pcl.created_at  >= date_trunc('month', NOW())
+          AND pcl.created_at  >= :desde
         GROUP BY i.id_item, i.external_id, i.titulo, i.atributos
         ORDER BY consultas_mes DESC
         LIMIT 20
-    """), {"emp": emp})
+    """), {"emp": emp, "desde": desde})
 
     props_consultadas: list[PropConsultada] = [
         PropConsultada(
@@ -319,7 +378,9 @@ async def get_cliente_dashboard(
 
     return ClienteDashboardResponse(
         empresa_nombre    = config["nombre"],
+        periodo           = periodo,
         kpis              = ClienteKPIs(**dict(kpi)),
+        whatsapp_kpis     = whatsapp_kpis,
         leads_recientes   = leads_recientes,
         actividad_bot     = ActividadBot(**dict(act)),
         props_con_leads   = props_con_leads,

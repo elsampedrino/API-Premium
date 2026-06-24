@@ -244,7 +244,7 @@ async def get_cliente_dashboard(
     act_row = await db.execute(text("""
         SELECT
             COUNT(*)::int                                                    AS conversaciones_mes,
-            ROUND(COUNT(*) / GREATEST(:dias::numeric, 1), 1)::float         AS promedio_diario
+            ROUND(COUNT(*) / GREATEST((:dias)::numeric, 1), 1)::float      AS promedio_diario
         FROM premium_chat_logs
         WHERE id_empresa = :emp
           AND created_at >= :desde

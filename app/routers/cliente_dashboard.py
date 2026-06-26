@@ -1,16 +1,22 @@
 """
-cliente_dashboard.py — Dashboard para el usuario cliente (inmobiliaria).
+cliente_dashboard.py — Dashboard omnicanal para el usuario cliente (inmobiliaria).
 
 Ruta: GET /cliente/dashboard?periodo=mes_actual|7d|30d|90d
 
+Arquitectura: el rendimiento por canal se calcula vía CHANNEL_PROVIDERS
+(ver app/services/channel_metrics.py). Cada canal decide si está habilitado
+para la empresa y calcula sus propias métricas — este endpoint no contiene
+lógica específica de WhatsApp ni de Web, solo itera la lista de providers.
+Sumar un canal nuevo (Instagram DM, Messenger, Telegram...) no requiere
+modificar este archivo.
+
 Devuelve en una sola llamada:
-  - KPIs del período (leads, conversaciones, propiedades activas)
-  - KPIs WhatsApp (consultas, IA, derivadas humano, % automatización, leads)
-  - Leads recientes (últimos 15, con canal)
-  - Actividad del bot (conversaciones del período + promedio diario)
-  - Propiedades con más leads (top 10)
-  - Propiedades más consultadas sin lead (top 10)
-  - Alertas simples para el cliente
+  - summary: KPIs globales de la empresa, independientes de canal
+  - channels: rendimiento por canal habilitado (lista dinámica)
+  - leads_recientes: últimos 15 leads, con canal de origen
+  - actividad: conversaciones globales del período + promedio diario
+  - rankings: propiedades con más leads / más consultadas sin lead
+  - alertas: alertas operativas simples
 
 TODO (futura sección "Atención fuera de horario"):
   - consultas_fuera_horario (whatsapp_bot_after_hours)
@@ -27,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.admin_auth import get_current_admin
 from app.core.database import get_db
 from app.models.db_models import UsuarioAdmin
+from app.services.channel_metrics import CHANNEL_PROVIDERS, ChannelBlock
 
 router = APIRouter()
 
@@ -51,19 +58,13 @@ def _calcular_desde(periodo: str) -> datetime:
 
 # ─── Modelos de respuesta ─────────────────────────────────────────────────────
 
-class ClienteKPIs(BaseModel):
-    leads_mes: int
+class Summary(BaseModel):
+    leads_periodo: int
     leads_nuevos: int
-    conversaciones_mes: int
+    consultas_periodo: int
     propiedades_activas: int
-
-
-class WhatsAppKPIs(BaseModel):
-    consultas_whatsapp: int
-    ia_respondio: int
-    derivadas_humano: int
-    porcentaje_automatizacion: float   # 0–100
-    leads_whatsapp: int
+    canales_activos: int
+    canales_disponibles: int   # preparado para upsell futuro, no destacado en UI todavía
 
 
 class LeadResumen(BaseModel):
@@ -75,8 +76,8 @@ class LeadResumen(BaseModel):
     canal: str
 
 
-class ActividadBot(BaseModel):
-    conversaciones_mes: int
+class Actividad(BaseModel):
+    conversaciones_periodo: int
     promedio_diario: float
 
 
@@ -84,14 +85,19 @@ class PropConLeads(BaseModel):
     external_id: str        # identificador principal (ej: PROP-001)
     titulo: str
     ubicacion: str | None
-    leads_mes: int
+    leads_periodo: int
 
 
 class PropConsultada(BaseModel):
     external_id: str
     titulo: str
     ubicacion: str | None
-    consultas_mes: int
+    consultas_periodo: int
+
+
+class Rankings(BaseModel):
+    props_con_leads: list[PropConLeads]
+    props_consultadas: list[PropConsultada]
 
 
 class AlertaCliente(BaseModel):
@@ -102,14 +108,13 @@ class AlertaCliente(BaseModel):
 class ClienteDashboardResponse(BaseModel):
     empresa_nombre: str
     periodo: str
-    kpis: ClienteKPIs
-    whatsapp_kpis: WhatsAppKPIs
-    leads_recientes: list[LeadResumen]
-    actividad_bot: ActividadBot
-    props_con_leads: list[PropConLeads]
-    props_consultadas: list[PropConsultada]
-    alertas: list[AlertaCliente]
     generado_en: str
+    summary: Summary
+    channels: list[ChannelBlock]
+    leads_recientes: list[LeadResumen]
+    actividad: Actividad
+    rankings: Rankings
+    alertas: list[AlertaCliente]
 
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
@@ -136,53 +141,48 @@ async def get_cliente_dashboard(
     emp   = current_user.id_empresa
     desde = _calcular_desde(periodo)
 
-    # ── KPIs principales ───────────────────────────────────────────────────────
+    # ── Empresa: nombre, servicios (para habilitar canales), notificaciones, catálogo ──
+    config_row = await db.execute(text("""
+        SELECT e.nombre, e.servicios, e.notificaciones, erc.github_repo
+        FROM empresas e
+        LEFT JOIN empresa_rubro_catalogos erc
+               ON erc.id_empresa = e.id_empresa AND erc.id_rubro = :rubro
+        WHERE e.id_empresa = :emp
+    """), {"emp": emp, "rubro": _ID_RUBRO_INMOBILIARIA})
+    config = config_row.mappings().one()
+    servicios = config["servicios"] or {}
+
+    # ── Rendimiento por canal (omnicanal) ─────────────────────────────────────
+    channels: list[ChannelBlock] = [
+        await provider.get_metrics(db, emp, desde)
+        for provider in CHANNEL_PROVIDERS
+        if provider.is_enabled(servicios)
+    ]
+
+    # ── Summary (KPIs globales, independientes de canal) ─────────────────────
     kpi_row = await db.execute(text("""
         SELECT
             (SELECT COUNT(*) FROM leads
-             WHERE id_empresa = :emp AND created_at >= :desde)            AS leads_mes,
+             WHERE id_empresa = :emp AND created_at >= :desde)            AS leads_periodo,
             (SELECT COUNT(*) FROM leads
              WHERE id_empresa = :emp AND estado = 'nuevo'
                AND created_at >= :desde)                                  AS leads_nuevos,
             (SELECT COUNT(*) FROM premium_chat_logs
-             WHERE id_empresa = :emp AND created_at >= :desde)            AS conversaciones_mes,
+             WHERE id_empresa = :emp AND created_at >= :desde)            AS consultas_periodo,
             (SELECT COUNT(*) FROM items
              WHERE id_empresa = :emp AND activo = true)                   AS propiedades_activas
     """), {"emp": emp, "desde": desde})
     kpi = kpi_row.mappings().one()
 
-    # ── WhatsApp KPIs ─────────────────────────────────────────────────────────
-    wa_row = await db.execute(text("""
-        SELECT
-            (SELECT COUNT(*) FROM premium_chat_logs
-             WHERE id_empresa = :emp AND canal = 'whatsapp'
-               AND created_at >= :desde)                                      AS consultas_whatsapp,
-            (SELECT COUNT(*) FROM premium_conversion_logs
-             WHERE id_empresa = :emp AND event_type = 'whatsapp_bot_after_hours'
-               AND created_at >= :desde)                                      AS ia_respondio,
-            (SELECT COUNT(*) FROM premium_conversion_logs
-             WHERE id_empresa = :emp AND event_type = 'whatsapp_handoff_business_hours'
-               AND created_at >= :desde)                                      AS derivadas_humano,
-            (SELECT COUNT(*) FROM leads
-             WHERE id_empresa = :emp AND canal = 'whatsapp'
-               AND created_at >= :desde)                                      AS leads_whatsapp
-    """), {"emp": emp, "desde": desde})
-    wa = wa_row.mappings().one()
-    _ia    = int(wa["ia_respondio"])
-    _human = int(wa["derivadas_humano"])
-    _total_wa = _ia + _human
-    _pct_autom = round(_ia / _total_wa * 100, 1) if _total_wa > 0 else 0.0
-    whatsapp_kpis = WhatsAppKPIs(
-        consultas_whatsapp        = int(wa["consultas_whatsapp"]),
-        ia_respondio              = _ia,
-        derivadas_humano          = _human,
-        porcentaje_automatizacion = _pct_autom,
-        leads_whatsapp            = int(wa["leads_whatsapp"]),
+    summary = Summary(
+        **dict(kpi),
+        canales_activos=len(channels),
+        canales_disponibles=len(CHANNEL_PROVIDERS),
     )
 
     # ── Leads recientes (últimos 15 siempre, sin filtro de período) ──────────
     leads_rows = await db.execute(text("""
-        SELECT id_lead, nombre, telefono, estado, canal, metadata, created_at
+        SELECT id_lead, nombre, telefono, estado, COALESCE(canal, 'web') AS canal, metadata, created_at
         FROM leads
         WHERE id_empresa = :emp
         ORDER BY created_at DESC
@@ -234,22 +234,23 @@ async def get_cliente_dashboard(
                 or None
             ),
             estado           = r["estado"],
-            canal            = r["canal"] or "widget",
+            canal            = r["canal"],
         )
         for r in leads_raw
     ]
 
-    # ── Actividad del bot ──────────────────────────────────────────────────────
+    # ── Actividad global (todas las conversaciones, sin distinción de canal) ──
     _dias_periodo = (datetime.now(timezone.utc) - desde).days or 1
     act_row = await db.execute(text("""
         SELECT
-            COUNT(*)::int                                                    AS conversaciones_mes,
+            COUNT(*)::int                                                    AS conversaciones_periodo,
             ROUND(COUNT(*) / GREATEST((:dias)::numeric, 1), 1)::float      AS promedio_diario
         FROM premium_chat_logs
         WHERE id_empresa = :emp
           AND created_at >= :desde
     """), {"emp": emp, "desde": desde, "dias": _dias_periodo})
     act = act_row.mappings().one()
+    actividad = Actividad(**dict(act))
 
     # ── Propiedades con más leads ──────────────────────────────────────────────
     # Extrae IDs/títulos desde leads.metadata->propiedades_interes (JSONB)
@@ -258,7 +259,7 @@ async def get_cliente_dashboard(
         SELECT
             (prop->>'id')      AS id_item_str,
             prop->>'titulo'    AS titulo_fallback,
-            COUNT(*)           AS leads_mes
+            COUNT(*)           AS leads_periodo
         FROM leads,
              LATERAL jsonb_array_elements(
                  CASE WHEN jsonb_typeof(metadata->'propiedades_interes') = 'array'
@@ -270,7 +271,7 @@ async def get_cliente_dashboard(
           AND created_at >= :desde
           AND (prop->>'id') IS NOT NULL
         GROUP BY (prop->>'id'), prop->>'titulo'
-        ORDER BY leads_mes DESC
+        ORDER BY leads_periodo DESC
         LIMIT 20
     """), {"emp": emp, "desde": desde})
     leads_props_raw = leads_props_rows.mappings().all()
@@ -303,10 +304,10 @@ async def get_cliente_dashboard(
             titulo      = r["titulo_fallback"] or "Propiedad sin título"
             ubicacion   = None
         props_con_leads.append(PropConLeads(
-            external_id = external_id,
-            titulo      = titulo,
-            ubicacion   = ubicacion,
-            leads_mes   = int(r["leads_mes"]),
+            external_id   = external_id,
+            titulo        = titulo,
+            ubicacion     = ubicacion,
+            leads_periodo = int(r["leads_periodo"]),
         ))
     props_con_leads = props_con_leads[:10]
 
@@ -318,7 +319,7 @@ async def get_cliente_dashboard(
             i.external_id,
             i.titulo,
             i.atributos,
-            COUNT(*)          AS consultas_mes
+            COUNT(*)          AS consultas_periodo
         FROM premium_chat_log_items pcli
         JOIN premium_chat_logs pcl ON pcl.id = pcli.id_chat_log
         JOIN items i ON i.id_item = pcli.id_item AND i.id_empresa = :emp
@@ -326,30 +327,25 @@ async def get_cliente_dashboard(
           AND pcl.id_lead      IS NULL
           AND pcl.created_at  >= :desde
         GROUP BY i.id_item, i.external_id, i.titulo, i.atributos
-        ORDER BY consultas_mes DESC
+        ORDER BY consultas_periodo DESC
         LIMIT 20
     """), {"emp": emp, "desde": desde})
 
     props_consultadas: list[PropConsultada] = [
         PropConsultada(
-            external_id  = r["external_id"],
-            titulo       = r["titulo"],
-            ubicacion    = _ubicacion(r["atributos"]),
-            consultas_mes = int(r["consultas_mes"]),
+            external_id       = r["external_id"],
+            titulo            = r["titulo"],
+            ubicacion         = _ubicacion(r["atributos"]),
+            consultas_periodo = int(r["consultas_periodo"]),
         )
         for r in consultadas_rows.mappings()
         if r["id_item"] not in ids_con_leads   # excluir las que ya tienen leads
     ][:10]
 
-    # ── Empresa nombre + config alertas ───────────────────────────────────────
-    config_row = await db.execute(text("""
-        SELECT e.nombre, e.notificaciones, erc.github_repo
-        FROM empresas e
-        LEFT JOIN empresa_rubro_catalogos erc
-               ON erc.id_empresa = e.id_empresa AND erc.id_rubro = :rubro
-        WHERE e.id_empresa = :emp
-    """), {"emp": emp, "rubro": _ID_RUBRO_INMOBILIARIA})
-    config = config_row.mappings().one()
+    rankings = Rankings(
+        props_con_leads=props_con_leads,
+        props_consultadas=props_consultadas,
+    )
 
     # ── Alertas ────────────────────────────────────────────────────────────────
     alertas: list[AlertaCliente] = []
@@ -359,10 +355,10 @@ async def get_cliente_dashboard(
             tipo    = "sin_propiedades",
             mensaje = "No tenés propiedades activas publicadas",
         ))
-    if int(kpi["leads_mes"]) == 0:
+    if int(kpi["leads_periodo"]) == 0:
         alertas.append(AlertaCliente(
             tipo    = "sin_leads",
-            mensaje = "No recibiste leads este mes",
+            mensaje = "No recibiste leads en este período",
         ))
     notif = config["notificaciones"] or {}
     if not notif.get("telegram", {}).get("enabled") and not notif.get("email", {}).get("enabled"):
@@ -377,14 +373,13 @@ async def get_cliente_dashboard(
         ))
 
     return ClienteDashboardResponse(
-        empresa_nombre    = config["nombre"],
-        periodo           = periodo,
-        kpis              = ClienteKPIs(**dict(kpi)),
-        whatsapp_kpis     = whatsapp_kpis,
-        leads_recientes   = leads_recientes,
-        actividad_bot     = ActividadBot(**dict(act)),
-        props_con_leads   = props_con_leads,
-        props_consultadas = props_consultadas,
-        alertas           = alertas,
-        generado_en       = datetime.now(timezone.utc).isoformat(),
+        empresa_nombre  = config["nombre"],
+        periodo         = periodo,
+        generado_en     = datetime.now(timezone.utc).isoformat(),
+        summary         = summary,
+        channels        = channels,
+        leads_recientes = leads_recientes,
+        actividad       = actividad,
+        rankings        = rankings,
+        alertas         = alertas,
     )

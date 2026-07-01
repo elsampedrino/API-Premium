@@ -175,8 +175,11 @@ async def _handle_message(
         )
         return
 
-    # ── Check modo de atención ────────────────────────────────────────────────
+    # ── Check canal y modo de atención ───────────────────────────────────────
     empresa = await get_empresa_by_slug(db, empresa_slug)
+    if empresa and not (empresa.servicios or {}).get("canal_whatsapp", False):
+        logger.info("Canal WhatsApp deshabilitado para %s — mensaje ignorado", empresa_slug)
+        return
     if empresa:
         active, reason = is_bot_active(empresa)
         if not active:

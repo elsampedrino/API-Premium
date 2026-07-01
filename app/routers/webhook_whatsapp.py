@@ -197,6 +197,13 @@ async def _handle_message(
                         ConversionEvent.WHATSAPP_HANDOFF_BUSINESS_HOURS,
                         {"handoff_type": "business_hours", "agent_phone": agent_phone},
                     )
+            elif reason in ("service_disabled", "disabled"):
+                if _should_notify_hours(from_number):
+                    await _send_reply(
+                        phone_number_id, from_number,
+                        f"Hola! El asistente de {empresa.nombre} no está disponible en este momento. "
+                        f"Podés comunicarte directamente con la inmobiliaria.",
+                    )
             logger.info("Bot inactivo (%s) para %s — sin respuesta IA", reason, from_number)
             return
 

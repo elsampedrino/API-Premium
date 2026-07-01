@@ -180,14 +180,15 @@ async def get_cliente_dashboard(
         canales_disponibles=len(CHANNEL_PROVIDERS),
     )
 
-    # ── Leads recientes (últimos 15 siempre, sin filtro de período) ──────────
+    # ── Leads del período (últimos 15 dentro del rango seleccionado) ─────────
     leads_rows = await db.execute(text("""
         SELECT id_lead, nombre, telefono, estado, COALESCE(canal, 'web') AS canal, metadata, created_at
         FROM leads
         WHERE id_empresa = :emp
+          AND created_at >= :desde
         ORDER BY created_at DESC
         LIMIT 15
-    """), {"emp": emp})
+    """), {"emp": emp, "desde": desde})
     leads_raw = leads_rows.mappings().all()
 
     # Enriquecer con título de propiedad desde metadata['propiedades_interes']
